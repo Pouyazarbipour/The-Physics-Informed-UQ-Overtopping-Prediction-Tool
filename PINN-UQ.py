@@ -29,8 +29,22 @@ from typing import Dict, List, Tuple
 import sys
 import io
 
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8')
+def ensure_utf8_stream(stream):
+    """Safe way to ensure UTF-8 without assuming .buffer exists"""
+    if hasattr(stream, 'encoding') and stream.encoding == 'utf-8':
+        return stream  # already good
+    try:
+        # Try notebook-safe way first
+        return io.TextIOWrapper(stream.detach(), encoding='utf-8')
+    except (AttributeError, io.UnsupportedOperation):
+        # Fallback: wrap the stream itself (works in many notebook kernels)
+        return io.TextIOWrapper(io.BufferedWriter(stream), encoding='utf-8')
+
+# Apply only if necessary
+if sys.stdout.encoding != 'utf-8':
+    sys.stdout = ensure_utf8_stream(sys.stdout)
+if sys.stderr.encoding != 'utf-8':
+    sys.stderr = ensure_utf8_stream(sys.stderr)
 
 import numpy as np
 import pandas as pd
@@ -124,10 +138,14 @@ CFG = {
     "warm_phys_end": 40,
     "mc_samples": 150,
     "dropout_p": 0.20,
-    "use_causal_mask": False,
-    "use_causal_grad_penalty": False,
-    "w_causal": 0,
+    "use_causal_mask": True,
+    "use_causal_grad_penalty": True,
+    "w_causal": 5e-4,
+    "causal_method": "dagma_nonlinear",  # options: dagma_linear, dagma_nonlinear, notears_linear
     "causal_edge_threshold": 0.02,
+    "dagma_lambda1": 0.02,
+    "dagma_lambda2": 0.005,
+    "dagma_hidden": 10,
     "notears_lambda1": 1e-2,
     "notears_max_iter": 25,
     "notears_inner_steps": 250,
@@ -397,7 +415,7 @@ def causal_discovery(events_train_df: pd.DataFrame, q_train: np.ndarray, cfg: Di
     }
 
 
-def plot_causal_heatmap(W: np.ndarray, labels: List[str], out_path: str):
+def plot_causal_heatmap(W: np.ndarray, labels: List[str], out_path: str, method_name: str):
     vmax = max(1e-3, np.max(np.abs(W)))
     fig, ax = plt.subplots(figsize=(7.2, 6.2))
     im = ax.imshow(W, cmap='coolwarm', vmin=-vmax, vmax=vmax)
@@ -407,7 +425,7 @@ def plot_causal_heatmap(W: np.ndarray, labels: List[str], out_path: str):
     ax.set_yticklabels(labels)
     ax.set_xlabel("Child (target)")
     ax.set_ylabel("Parent (source)")
-    ax.set_title("NOTEARS Weighted Adjacency (Training Data)")
+    ax.set_title(f"{method_name.upper()} Weighted Adjacency (Training Data)")
     cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     cbar.set_label("Edge weight")
     plt.tight_layout()
@@ -416,13 +434,13 @@ def plot_causal_heatmap(W: np.ndarray, labels: List[str], out_path: str):
     plt.close()
 
 
-def plot_causal_dag(W: np.ndarray, labels: List[str], out_path: str, threshold: float):
+def plot_causal_dag(W: np.ndarray, labels: List[str], out_path: str, threshold: float, method_name: str):
     d = len(labels)
     theta = np.linspace(0, 2 * np.pi, d, endpoint=False)
     xy = np.stack([np.cos(theta), np.sin(theta)], axis=1)
 
     fig, ax = plt.subplots(figsize=(7.5, 7.5))
-    ax.set_title("NOTEARS DAG (|weight| >= threshold)")
+    ax.set_title(f"{method_name.upper()} DAG (|weight| >= threshold)")
     ax.axis('off')
 
     for i, label in enumerate(labels):
@@ -1268,6 +1286,61 @@ def save_excel_with_details(events_df, q_obs, q_pred, q_euro, filename):
         print(f"Error saving {filename}: {e}")
         raise
 
+
+def plot_all_losses_together(history, save_path):
+    """
+    پلات همه lossهای مهم (data, phys, causal, total) در یک شکل
+    مناسب برای مقاله / گزارش
+    """
+    if not history.get("train_loss") or len(history["train_loss"]) == 0:
+        print("هیچ داده loss برای پلات وجود ندارد.")
+        return
+
+    fig, ax = plt.subplots(figsize=(9.5, 6.2))
+
+    epochs = np.arange(1, len(history["train_loss"]) + 1)
+
+    # خطوط اصلی
+    ax.plot(epochs, history["train_loss"], label="Total Loss (Train)", 
+            color='#1f77b4', linewidth=2.2, zorder=4)
+    ax.plot(epochs, history["val_loss"], label="Total Loss (Val)", 
+            color='#ff7f0e', linestyle='--', linewidth=2.0, zorder=3)
+
+    ax.plot(epochs, history["train_data_loss"], label="Data/NLL Loss (Train)", 
+            color='#2ca02c', linewidth=1.6, alpha=0.9)
+
+    ax.plot(epochs, history["train_phys_loss"], label="Physics Loss (Train)", 
+            color='#d62728', linewidth=1.6, alpha=0.9)
+
+    # فقط اگر causal loss معنادار باشد اضافه کن
+    has_causal = any(v > 1e-10 for v in history.get("train_causal_loss", []))
+    if has_causal:
+        ax.plot(epochs, history["train_causal_loss"], 
+                label="Causal Grad Penalty (Train)", 
+                color='#9467bd', linewidth=1.8, linestyle='-.')
+    else:
+        print("→ Causal loss همه صفر است → در پلات نشان داده نمی‌شود")
+
+    ax.set_xlabel("Epoch", fontsize=12)
+    ax.set_ylabel("Loss value", fontsize=12)
+    ax.set_title("Training & Validation Losses (including components)", fontsize=13, pad=12)
+
+    # اغلب lossها بهتر است log-scale شوند
+    ax.set_yscale('log')
+    ax.grid(True, which="both", ls="--", alpha=0.25, zorder=0)
+
+    ax.legend(frameon=True, edgecolor='0.7', facecolor='white', 
+              loc='upper right', fontsize=10.5, ncol=1 if has_causal else 2)
+
+    # حاشیه و ذخیره
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=400, bbox_inches='tight')
+    plt.savefig(save_path.replace('.png', '.pdf'), format='pdf', bbox_inches='tight')
+    plt.close(fig)
+
+    print(f"پلات ترکیبی lossها ذخیره شد: {save_path}")
+
+
 def main():
     clash_path = r"CLASH database.csv"
     events, q_arr = parse_clash(clash_path)
@@ -1288,19 +1361,28 @@ def main():
     te_events = events.iloc[te_idx].reset_index(drop=True)
     tr_q, va_q, te_q = q_arr[tr_idx], q_arr[va_idx], q_arr[te_idx]
 
-    causal = causal_discovery_notears(tr_events[FEATURE_COLUMNS], tr_q, CFG)
+    causal = causal_discovery(tr_events[FEATURE_COLUMNS], tr_q, CFG)
     W = causal["weighted_adjacency"]
-    np.save(os.path.join(CAUSAL_DIR, "notears_weighted_adjacency.npy"), W)
-    with open(os.path.join(CAUSAL_DIR, "notears_edges.json"), "w") as f:
+    backend_name = causal["backend"]["used"]
+    np.save(os.path.join(CAUSAL_DIR, f"{backend_name}_weighted_adjacency.npy"), W)
+    with open(os.path.join(CAUSAL_DIR, f"{backend_name}_edges.json"), "w") as f:
         json.dump({
             "variables": causal["variables"],
             "q_parent_features": causal["q_parent_features"],
             "edge_threshold": CFG["causal_edge_threshold"],
             "edges": causal["edge_list"],
+            "backend": causal["backend"],
         }, f, indent=2)
-    plot_causal_heatmap(W, causal["variables"], os.path.join(CAUSAL_DIR, "notears_heatmap.png"))
-    plot_causal_dag(W, causal["variables"], os.path.join(CAUSAL_DIR, "notears_dag.png"), CFG["causal_edge_threshold"])
+    plot_causal_heatmap(W, causal["variables"], os.path.join(CAUSAL_DIR, f"{backend_name}_heatmap.png"), backend_name)
+    plot_causal_dag(
+        W,
+        causal["variables"],
+        os.path.join(CAUSAL_DIR, f"{backend_name}_dag.png"),
+        CFG["causal_edge_threshold"],
+        backend_name,
+    )
     print("Causal results saved to", CAUSAL_DIR)
+    print("Causal backend:", causal["backend"])
     print("Parents of q:", causal["q_parent_features"])
 
     parent_idx = causal["q_parent_indices"]
@@ -1751,6 +1833,11 @@ def main():
         trues_train, preds_train, q_eurotop_train,
         "Train: Differences vs Sample (sorted)",
         os.path.join(PLOTS_DIR, "differences_vs_sample_train.png")
+    )
+
+    plot_all_losses_together(
+        history,
+        os.path.join(PLOTS_DIR, "all_losses_together_log_scale.png")
     )
 
     print("\nAll plots and corresponding raw data files have been saved.")
