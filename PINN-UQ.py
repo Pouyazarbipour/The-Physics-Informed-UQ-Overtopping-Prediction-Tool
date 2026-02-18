@@ -57,6 +57,12 @@ from torch.utils.data import Dataset, DataLoader
 from scipy.stats import probplot
 
 try:
+    import optuna
+    OPTUNA_AVAILABLE = True
+except Exception:
+    OPTUNA_AVAILABLE = False
+
+try:
     from dagma.linear import DagmaLinear
     from dagma.nonlinear import DagmaMLP, DagmaNonlinear
     DAGMA_AVAILABLE = True
@@ -152,6 +158,17 @@ CFG = {
     "notears_lr": 1e-2,
     "notears_h_tol": 1e-8,
     "notears_rho_max": 1e16,
+    "use_optuna": True,
+    "optuna_trials": 20,
+    "optuna_timeout_sec": None,
+    "optuna_train_epochs": 120,
+    "optuna_patience": 15,
+    "optuna_weight_space": {
+        "w_q": [1e-2, 10.0],
+        "w_phys_base": [1e-7, 1e-1],
+        "w_causal": [1e-6, 1e-2],
+        "w_phys_init": [1e-6, 1e-1],
+    },
 }
 
 G = 9.81
@@ -1341,6 +1358,165 @@ def plot_all_losses_together(history, save_path):
     print(f"پلات ترکیبی lossها ذخیره شد: {save_path}")
 
 
+
+def sample_optuna_weights(trial, cfg: Dict) -> Dict:
+    """Sample train-loss weights in log-scale so every weight can be optimized."""
+    bounds = cfg["optuna_weight_space"]
+    tuned = {
+        "w_q": trial.suggest_float("w_q", bounds["w_q"][0], bounds["w_q"][1], log=True),
+        "w_phys_base": trial.suggest_float("w_phys_base", bounds["w_phys_base"][0], bounds["w_phys_base"][1], log=True),
+        "w_causal": trial.suggest_float("w_causal", bounds["w_causal"][0], bounds["w_causal"][1], log=True),
+        "w_phys_init": trial.suggest_float("w_phys_init", bounds["w_phys_init"][0], bounds["w_phys_init"][1], log=True),
+    }
+    return tuned
+
+
+def build_runtime_cfg(base_cfg: Dict, override: Dict = None) -> Dict:
+    cfg = dict(base_cfg)
+    if override:
+        cfg.update(override)
+    return cfg
+
+
+def train_model_once(
+    cfg_runtime: Dict,
+    scalers: Dict,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    non_causal_idx: List[int],
+    feature_mask: np.ndarray,
+    save_best_path: str = None,
+):
+    model = SurrogateModel(cfg_runtime, feature_mask=feature_mask).to(DEVICE)
+    w_phys_init = float(cfg_runtime.get("w_phys_init", 1e-2))
+    w_phys_log = nn.Parameter(torch.log(torch.tensor(max(w_phys_init, 1e-10), dtype=torch.float32, device=DEVICE)))
+
+    opt = torch.optim.AdamW([
+        {'params': model.parameters(), 'lr': cfg_runtime['lr']},
+        {'params': [w_phys_log], 'lr': cfg_runtime['lr'] * 0.05}
+    ], weight_decay=cfg_runtime['weight_decay'])
+
+    history = {
+        "train_loss": [], "train_data_loss": [], "train_phys_loss": [],
+        "train_causal_loss": [], "train_grad_norm": [],
+        "val_loss": [], "val_data_loss": [], "val_phys_loss": [],
+        "w_phys_history": []
+    }
+
+    best_val_r2 = -np.inf
+    best_epoch = 0
+    epochs_no_improve = 0
+    best_state = None
+
+    for ep in range(1, cfg_runtime['epochs'] + 1):
+        warm_factor = get_stage_weights(ep, cfg_runtime)
+        wp = math.exp(w_phys_log.item()) * warm_factor
+
+        tr_loss, tr_data, tr_phys, tr_causal, tr_grad = train_epoch(
+            model, train_loader, opt, scalers, ep, cfg_runtime, non_causal_idx, wp
+        )
+        va_loss, va_data, va_phys, _, _ = validate(model, val_loader, scalers, ep, cfg_runtime, wp)
+
+        history["train_loss"].append(tr_loss)
+        history["train_data_loss"].append(tr_data)
+        history["train_phys_loss"].append(tr_phys)
+        history["train_causal_loss"].append(tr_causal)
+        history["train_grad_norm"].append(tr_grad)
+        history["val_loss"].append(va_loss)
+        history["val_data_loss"].append(va_data)
+        history["val_phys_loss"].append(va_phys)
+        history["w_phys_history"].append(math.exp(w_phys_log.item()))
+
+        va_preds, va_trues = get_predictions(model, val_loader, scalers, mc_samples=0)
+        va_r2 = r2_score(va_trues, va_preds)
+
+        if ep % cfg_runtime['print_every'] == 0:
+            print(
+                f"Epoch {ep:03d}  train_loss={tr_loss:.6f}  val_loss={va_loss:.6f}  "
+                f"val_r2={va_r2:.4f}  w_phys={math.exp(w_phys_log.item()):.2e}"
+            )
+
+        improved = va_r2 > best_val_r2 + 1e-5
+        if improved:
+            best_val_r2 = va_r2
+            best_epoch = ep
+            epochs_no_improve = 0
+            best_state = {
+                "epoch": ep,
+                "model_state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                "optimizer_state_dict": opt.state_dict(),
+                "w_phys_log": w_phys_log.detach().cpu().clone(),
+                "val_loss": va_loss,
+                "val_r2": va_r2,
+            }
+            if save_best_path is not None:
+                torch.save(best_state, save_best_path)
+        else:
+            epochs_no_improve += 1
+            if epochs_no_improve >= cfg_runtime['patience']:
+                print(f"Early stopping at epoch {ep}")
+                break
+
+    if best_state is None:
+        best_state = {
+            "epoch": cfg_runtime['epochs'],
+            "model_state_dict": {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+            "optimizer_state_dict": opt.state_dict(),
+            "w_phys_log": w_phys_log.detach().cpu().clone(),
+            "val_loss": float(history["val_loss"][-1]) if history["val_loss"] else float("inf"),
+            "val_r2": float(best_val_r2),
+        }
+
+    model.load_state_dict(best_state["model_state_dict"])
+    model.to(DEVICE)
+    w_phys_log.data = best_state["w_phys_log"].to(device=DEVICE)
+
+    return model, w_phys_log, history, float(best_state["val_r2"]), int(best_state["epoch"])
+
+
+def run_optuna_for_loss_weights(
+    base_cfg: Dict,
+    scalers: Dict,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    non_causal_idx: List[int],
+    feature_mask: np.ndarray,
+):
+    if not base_cfg.get("use_optuna", False):
+        print("Optuna tuning is disabled by configuration.")
+        return {}, None
+    if not OPTUNA_AVAILABLE:
+        print("Optuna is not installed; skipping weight tuning and using configured defaults.")
+        return {}, None
+
+    print("Starting Optuna optimization for train-loss weights (w_q, w_phys_base, w_causal, w_phys_init)...")
+
+    def objective(trial):
+        sampled = sample_optuna_weights(trial, base_cfg)
+        trial_cfg = build_runtime_cfg(base_cfg, sampled)
+        trial_cfg["epochs"] = int(base_cfg["optuna_train_epochs"])
+        trial_cfg["patience"] = int(base_cfg["optuna_patience"])
+        trial_cfg["print_every"] = max(10, int(base_cfg["optuna_train_epochs"]) // 4)
+
+        _, _, _, best_val_r2, best_epoch = train_model_once(
+            trial_cfg, scalers, train_loader, val_loader, non_causal_idx, feature_mask, save_best_path=None
+        )
+
+        trial.set_user_attr("best_epoch", int(best_epoch))
+        return best_val_r2
+
+    study = optuna.create_study(direction="maximize", study_name="overtopping_loss_weight_optimization")
+    study.optimize(
+        objective,
+        n_trials=int(base_cfg["optuna_trials"]),
+        timeout=base_cfg.get("optuna_timeout_sec", None),
+        show_progress_bar=False,
+    )
+
+    print(f"Optuna finished. Best val_r2={study.best_value:.5f}")
+    print(f"Best weights: {study.best_params}")
+    return dict(study.best_params), study
+
 def main():
     clash_path = r"CLASH database.csv"
     events, q_arr = parse_clash(clash_path)
@@ -1410,91 +1586,45 @@ def main():
     val_loader = DataLoader(val_ds, batch_size=CFG['batch_size'], shuffle=False, collate_fn=collate_fn)
     test_loader = DataLoader(test_ds, batch_size=CFG['batch_size'], shuffle=False, collate_fn=collate_fn)
 
-    model = SurrogateModel(CFG, feature_mask=feature_mask).to(DEVICE)
-
-    w_phys_log = nn.Parameter(torch.log(torch.tensor(1e-2, dtype=torch.float32)))
-
-    opt = torch.optim.AdamW([
-        {'params': model.parameters(), 'lr': CFG['lr']},
-        {'params': [w_phys_log], 'lr': CFG['lr'] * 0.05}
-    ], weight_decay=CFG['weight_decay'])
-
-    history = {
-        "train_loss": [], "train_data_loss": [], "train_phys_loss": [],
-        "train_causal_loss": [], "train_grad_norm": [],
-        "val_loss": [], "val_data_loss": [], "val_phys_loss": [],
-        "w_phys_history": []
-    }
-
-    best_val_r2 = -np.inf
-    best_epoch = 0
-    epochs_no_improve = 0
-
-    for ep in range(1, CFG['epochs'] + 1):
-        t0 = time.time()
-
-        warm_factor = get_stage_weights(ep, CFG)
-        w_phys_value = math.exp(w_phys_log.item()) * warm_factor
-        wp = w_phys_value
-
-        tr_loss, tr_data, tr_phys, tr_causal, tr_grad = train_epoch(
-            model, train_loader, opt, scalers, ep, CFG, non_causal_idx, wp
+    best_weight_cfg = {}
+    optuna_study = None
+    if CFG.get("use_optuna", False):
+        best_weight_cfg, optuna_study = run_optuna_for_loss_weights(
+            CFG, scalers, train_loader, val_loader, non_causal_idx, feature_mask
         )
-        va_loss, va_data, va_phys, _, _ = validate(model, val_loader, scalers, ep, CFG, wp)
+        if best_weight_cfg:
+            CFG.update(best_weight_cfg)
 
-        history["train_loss"].append(tr_loss)
-        history["train_data_loss"].append(tr_data)
-        history["train_phys_loss"].append(tr_phys)
-        history["train_causal_loss"].append(tr_causal)
-        history["train_grad_norm"].append(tr_grad)
-        history["val_loss"].append(va_loss)
-        history["val_data_loss"].append(va_data)
-        history["val_phys_loss"].append(va_phys)
-        history["w_phys_history"].append(math.exp(w_phys_log.item()))
-
-        va_preds, va_trues = get_predictions(model, val_loader, scalers, mc_samples=0)
-        va_r2 = r2_score(va_trues, va_preds)
-
-        if ep % CFG['print_every'] == 0:
-            dt = time.time() - t0
-            print(f"Epoch {ep:03d}  train_loss={tr_loss:.6f}  val_loss={va_loss:.6f}  "
-                  f"val_r2={va_r2:.4f}  w_phys={math.exp(w_phys_log.item()):.2e}  time={dt:.1f}s")
-
-        improved = va_r2 > best_val_r2 + 1e-5
-
-        if improved:
-            best_val_r2 = va_r2
-            best_epoch = ep
-            epochs_no_improve = 0
-
-            torch.save({
-                "epoch": ep,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": opt.state_dict(),
-                "w_phys_log": w_phys_log,
-                "val_loss": va_loss,
-                "val_r2": va_r2,
-            }, os.path.join(CKPT_DIR, "best_model.pth"))
-
-            print(f"New best model saved at epoch {ep}  (val_r2={va_r2:.4f}, w_phys={math.exp(w_phys_log.item()):.2e})")
-
-        else:
-            epochs_no_improve += 1
-            if epochs_no_improve >= CFG['patience']:
-                print(f"Early stopping at epoch {ep}")
-                print(f"Best epoch was {best_epoch} with val_r2={best_val_r2:.4f}")
-                break
+    final_cfg = build_runtime_cfg(CFG)
+    model, w_phys_log, history, best_val_r2, best_epoch = train_model_once(
+        final_cfg,
+        scalers,
+        train_loader,
+        val_loader,
+        non_causal_idx,
+        feature_mask,
+        save_best_path=os.path.join(CKPT_DIR, "best_model.pth"),
+    )
 
     torch.save({
         "model_state_dict": model.state_dict(),
-        "w_phys_log": w_phys_log,
+        "w_phys_log": w_phys_log.detach().cpu().clone(),
     }, os.path.join(CKPT_DIR, "final_model.pth"))
 
     checkpoint = torch.load(os.path.join(CKPT_DIR, "best_model.pth"), map_location=DEVICE)
     model.load_state_dict(checkpoint["model_state_dict"])
     if "w_phys_log" in checkpoint:
-        w_phys_log.data = checkpoint["w_phys_log"]
+        w_phys_log.data = checkpoint["w_phys_log"].to(device=DEVICE)
     model.to(DEVICE)
+
+    if optuna_study is not None:
+        optuna_payload = {
+            "best_value": float(optuna_study.best_value),
+            "best_params": optuna_study.best_params,
+            "n_trials": len(optuna_study.trials),
+        }
+        with open(os.path.join(REPORTS_DIR, "optuna_study_best.json"), "w") as f:
+            json.dump(optuna_payload, f, indent=2)
 
     print(f"Loaded best model from epoch {checkpoint['epoch']}  val_r2={checkpoint.get('val_r2', 'N/A'):.4f}")
     print(f"Learned physics weight: {math.exp(w_phys_log.item()):.2e}")
@@ -1540,6 +1670,12 @@ def main():
             "coverage_95": float(coverage_95),
             "mean_total_std_test": float(np.mean(tot_test)),
             "final_w_phys": float(math.exp(w_phys_log.item())),
+            "optimized_loss_weights": {
+                "w_q": float(CFG["w_q"]),
+                "w_phys_base": float(CFG["w_phys_base"]),
+                "w_causal": float(CFG["w_causal"]),
+                "w_phys_init": float(CFG.get("w_phys_init", 1e-2)),
+            },
             "history": {k: [float(v) for v in vals] for k, vals in history.items()},
             "causal_q_parents": causal["q_parent_features"],
         }, f, indent=2, default=float)
