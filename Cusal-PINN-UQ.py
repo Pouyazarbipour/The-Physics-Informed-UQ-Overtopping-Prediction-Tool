@@ -54,7 +54,9 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
-from scipy.stats import probplot
+from scipy.stats import probplot, norm
+
+from sklearn.calibration import calibration_curve
 
 try:
     import optuna
@@ -144,8 +146,8 @@ CFG = {
     "warm_phys_end": 40,
     "mc_samples": 150,
     "dropout_p": 0.20,
-    "use_causal_mask": True,
-    "use_causal_grad_penalty": True,
+    "use_causal_mask": False,
+    "use_causal_grad_penalty": False,
     "w_causal": 5e-4,
     "causal_method": "dagma_nonlinear",  # options: dagma_linear, dagma_nonlinear, notears_linear
     "causal_edge_threshold": 0.02,
@@ -618,7 +620,7 @@ def mc_sample_full(model, scalars, scalers, mc_samples=150, device=DEVICE):
     epi_std = mean_q * epi_std_log.cpu().numpy()
     ale_std = mean_q * ale_std_log.cpu().numpy()
 
-    return mean_q, total_std, epi_std, ale_std
+    return mean_q, total_std, epi_std, ale_std, q_samples.cpu().numpy()
 
 def grad_norm(model):
     tot = 0.0
@@ -1157,13 +1159,14 @@ def plot_q_vs_sample(obs, pred, euro, title, path, std=None, unc_type=None):
     plt.savefig(path.replace('.png', '.pdf'), format='pdf', bbox_inches='tight')
     plt.close()
 
-    save_plot_data({
+    data_dict = {
         'sample_idx': x,
         'observed': obs_s,
         'predicted': pred_s,
         'eurotop': euro_s,
         'std': std_s if std_s is not None else np.full_like(x, np.nan)
-    }, f"data_{os.path.basename(path).replace('.png','')}.xlsx")
+    }
+    save_plot_data(data_dict, f"data_{os.path.basename(path).replace('.png','')}.xlsx")
 
 def plot_obs_vs_pred_sample_only(obs, pred, title, path):
     sort_idx = np.argsort(obs)
@@ -1517,6 +1520,73 @@ def run_optuna_for_loss_weights(
     print(f"Best weights: {study.best_params}")
     return dict(study.best_params), study
 
+def calculate_exceedance_prob(model, loader, scalers, q_crit=0.1, N_mc=1000, dist='empirical'):
+    probs = []
+    y_true = []
+    for scalars, _, target in loader:
+        scalars = scalars.to(DEVICE)
+        mean_q, total_std, epi_std, ale_std, samples = mc_sample_full(model, scalars, scalers, mc_samples=N_mc)
+        if dist == 'empirical':
+            prob_exceed = (samples > q_crit).mean(axis=0)
+        else:  # lognormal
+            mu, logvar = model(scalars)
+            sigma = torch.exp(0.5 * logvar).cpu().numpy()
+            mu = mu.cpu().numpy()
+            prob_exceed = 1 - norm.cdf((np.log(q_crit) - mu) / sigma)
+        probs.extend(prob_exceed)
+        y_true.extend(scalers['q'].inverse(target.numpy()))
+    return np.array(probs), np.array(y_true)
+
+def plot_fragility_curve(hm0_grid, probs_grid, path):
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(hm0_grid, probs_grid, label='P(q > q_crit)')
+    ax.set_xlabel('Hm0')
+    ax.set_ylabel('Probability')
+    ax.set_title('Fragility Curve')
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=400)
+    plt.close()
+
+def plot_reliability_diagram(y_true, probs, path):
+    observed, predicted = calibration_curve(y_true > 0.1, probs, n_bins=10)
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.plot(predicted, observed, marker='o')
+    ax.plot([0,1], [0,1], 'k--')
+    ax.set_xlabel('Predicted Probability')
+    ax.set_ylabel('Observed Frequency')
+    ax.set_title('Reliability Diagram')
+    plt.tight_layout()
+    plt.savefig(path, dpi=400)
+    plt.close()
+
+def create_sweep_grid(events_df, scalers, param='hm0', n_points=200):
+    fixed_params = events_df.mean().to_dict()
+    grid = np.linspace(events_df[param].min(), 1.5 * events_df[param].max(), n_points)
+    X_grid_raw = np.tile(list(fixed_params.values()), (n_points, 1))
+    hm0_idx = FEATURE_COLUMNS.index(param)
+    X_grid_raw[:, hm0_idx] = grid
+    X_grid = (X_grid_raw - scalers['scalars']['mean']) / scalers['scalars']['std']
+    return torch.tensor(X_grid, dtype=torch.float32), torch.tensor(X_grid_raw, dtype=torch.float32), grid
+
+def check_monotonicity(mu_grid, grid):
+    dq_dparam = np.diff(mu_grid) / np.diff(grid)
+    return np.all(dq_dparam > 0)
+
+def plot_extrapolation(mu_pinn, sigma_pinn, mu_nn, mu_euro, grid, path):
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.plot(grid, mu_euro, label='EurOtop')
+    ax.plot(grid, mu_nn, label='Pure NN')
+    ax.plot(grid, mu_pinn, label='PINN')
+    ax.fill_between(grid, mu_pinn - sigma_pinn, mu_pinn + sigma_pinn, alpha=0.2)
+    ax.set_yscale('log')
+    ax.set_xlabel('Hm0 (m)')
+    ax.set_ylabel('q (l/s/m)')
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(path, dpi=400)
+    plt.close()
+
 def main():
     clash_path = r"CLASH database.csv"
     events, q_arr = parse_clash(clash_path)
@@ -1606,6 +1676,24 @@ def main():
         save_best_path=os.path.join(CKPT_DIR, "best_model.pth"),
     )
 
+    # Train pure NN without physics and causal
+    pure_cfg = build_runtime_cfg(CFG)
+    pure_cfg['w_phys_base'] = 0.0
+    pure_cfg['use_causal_mask'] = False
+    pure_cfg['use_causal_grad_penalty'] = False
+    pure_cfg['w_causal'] = 0.0
+    pure_non_causal_idx = []
+    pure_feature_mask = np.ones(len(FEATURE_COLUMNS), dtype=np.float32)
+    model_pure, _, history_pure, _, _ = train_model_once(
+        pure_cfg,
+        scalers,
+        train_loader,
+        val_loader,
+        pure_non_causal_idx,
+        pure_feature_mask,
+        save_best_path=os.path.join(CKPT_DIR, "best_model_pure.pth"),
+    )
+
     torch.save({
         "model_state_dict": model.state_dict(),
         "w_phys_log": w_phys_log.detach().cpu().clone(),
@@ -1616,6 +1704,10 @@ def main():
     if "w_phys_log" in checkpoint:
         w_phys_log.data = checkpoint["w_phys_log"].to(device=DEVICE)
     model.to(DEVICE)
+
+    checkpoint_pure = torch.load(os.path.join(CKPT_DIR, "best_model_pure.pth"), map_location=DEVICE)
+    model_pure.load_state_dict(checkpoint_pure["model_state_dict"])
+    model_pure.to(DEVICE)
 
     if optuna_study is not None:
         optuna_payload = {
@@ -1975,6 +2067,29 @@ def main():
         history,
         os.path.join(PLOTS_DIR, "all_losses_together_log_scale.png")
     )
+
+    # Case 1: Design-Oriented Uncertainty
+    probs_test, y_true_test = calculate_exceedance_prob(model, test_loader, scalers)
+    # For EurOtop, deterministic, so P = 1 if q_euro > q_crit else 0
+    probs_euro = (q_eurotop_test > 0.1).astype(float)
+
+    # Fragility Curve
+    X_grid, X_grid_raw, hm0_grid = create_sweep_grid(te_events, scalers, 'hm0')
+    probs_grid = calculate_exceedance_prob(model, X_grid, scalers)[0]
+    plot_fragility_curve(hm0_grid, probs_grid, os.path.join(PLOTS_DIR, "fragility_curve.png"))
+
+    # Reliability Diagram
+    plot_reliability_diagram(y_true_test, probs_test, os.path.join(PLOTS_DIR, "reliability_diagram.png"))
+
+    # Case 2: Extrapolation Behavior
+    X_grid, X_grid_raw, hm0_grid = create_sweep_grid(tr_events, scalers, 'hm0')
+    mu_pinn, sigma_pinn, _, _, _ = mc_sample_full(model, X_grid.to(DEVICE), scalers, CFG['mc_samples'])
+    mu_nn, _, _, _, _ = mc_sample_full(model_pure, X_grid.to(DEVICE), scalers, CFG['mc_samples'])
+    mu_euro = compute_eurotop_q_torch(X_grid_raw.to(DEVICE)).cpu().numpy()
+    plot_extrapolation(mu_pinn, sigma_pinn, mu_nn, mu_euro, hm0_grid, os.path.join(PLOTS_DIR, "extrapolation_behavior.png"))
+
+    is_monotonic = check_monotonicity(mu_pinn, hm0_grid)
+    print(f"Monotonicity check: {is_monotonic}")
 
     print("\nAll plots and corresponding raw data files have been saved.")
     print(f"Plots directory     : {PLOTS_DIR}")
