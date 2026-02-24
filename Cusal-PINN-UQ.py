@@ -146,6 +146,7 @@ CFG = {
     "warm_phys_end": 40,
     "mc_samples": 150,
     "q_crit_values": [1e-4, 1e-3, 1e-2],
+    "save_plot_data_excel": False,
     "dropout_p": 0.20,
     "use_causal_mask": False,
     "use_causal_grad_penalty": False,
@@ -161,7 +162,7 @@ CFG = {
     "notears_lr": 1e-2,
     "notears_h_tol": 1e-8,
     "notears_rho_max": 1e16,
-    "use_optuna": False,
+    "use_optuna": True,
     "optuna_trials": 20,
     "optuna_timeout_sec": None,
     "optuna_train_epochs": 120,
@@ -815,6 +816,8 @@ def build_feature_mask(parent_indices, use_mask):
     return mask
 
 def save_plot_data(data_dict: dict, filename: str):
+    if not CFG.get("save_plot_data_excel", False):
+        return
     path = os.path.join(DATA_DIR, filename)
     try:
         df = pd.DataFrame(data_dict)
@@ -1551,7 +1554,7 @@ def plot_fragility_curve(hm0_grid, probs_grid_dict, path):
     fig, ax = plt.subplots(figsize=(6, 5))
     for q_crit, probs_grid in probs_grid_dict.items():
         ax.plot(hm0_grid, probs_grid, label=f'P(q > {q_crit:g})')
-    ax.set_xlabel('Hm0')
+    ax.set_xlabel('Rc/Hm0')
     ax.set_ylabel('Probability')
     ax.set_title('Fragility Curve')
     ax.legend()
@@ -1581,6 +1584,23 @@ def create_sweep_grid(events_df, scalers, param='hm0', n_points=200):
     X_grid_raw[:, hm0_idx] = grid
     X_grid = (X_grid_raw - scalers['scalars']['mean']) / scalers['scalars']['std']
     return torch.tensor(X_grid, dtype=torch.float32), torch.tensor(X_grid_raw, dtype=torch.float32), grid
+
+
+def create_rc_hm0_sweep_grid(events_df, scalers, n_points=200):
+    fixed_params = events_df.mean().to_dict()
+    rc_hm0 = (events_df['rc'] / np.clip(events_df['hm0'], 1e-8, None)).to_numpy()
+    ratio_grid = np.linspace(max(0.0, np.nanmin(rc_hm0)), 1.2 * np.nanmax(rc_hm0), n_points)
+
+    X_grid_raw = np.tile(list(fixed_params.values()), (n_points, 1))
+    hm0_idx = FEATURE_COLUMNS.index('hm0')
+    rc_idx = FEATURE_COLUMNS.index('rc')
+    hm0_ref = max(float(fixed_params['hm0']), 1e-6)
+
+    X_grid_raw[:, hm0_idx] = hm0_ref
+    X_grid_raw[:, rc_idx] = ratio_grid * hm0_ref
+
+    X_grid = (X_grid_raw - scalers['scalars']['mean']) / scalers['scalars']['std']
+    return torch.tensor(X_grid, dtype=torch.float32), torch.tensor(X_grid_raw, dtype=torch.float32), ratio_grid
 
 def check_monotonicity(mu_grid, grid):
     dq_dparam = np.diff(mu_grid) / np.diff(grid)
@@ -2092,11 +2112,11 @@ def main():
             y_true_test = y_true_local
 
     # Fragility Curve
-    X_grid, X_grid_raw, hm0_grid = create_sweep_grid(te_events, scalers, 'hm0')
+    X_grid, X_grid_raw, rc_hm0_grid = create_rc_hm0_sweep_grid(te_events, scalers)
     probs_grid_dict = {}
     for q_crit in q_crit_values:
         probs_grid_dict[q_crit] = calculate_exceedance_prob(model, X_grid, scalers, q_crit=q_crit)[0]
-    plot_fragility_curve(hm0_grid, probs_grid_dict, os.path.join(PLOTS_DIR, "fragility_curve.png"))
+    plot_fragility_curve(rc_hm0_grid, probs_grid_dict, os.path.join(PLOTS_DIR, "fragility_curve.png"))
 
     # Reliability Diagram
     plot_reliability_diagram(y_true_test, probs_test_dict, os.path.join(PLOTS_DIR, "reliability_diagram.png"))
