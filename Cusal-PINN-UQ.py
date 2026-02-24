@@ -145,6 +145,7 @@ CFG = {
     "warm_phys_start": 10,
     "warm_phys_end": 40,
     "mc_samples": 150,
+    "q_crit_values": [1e-4, 1e-3, 1e-2],
     "dropout_p": 0.20,
     "use_causal_mask": False,
     "use_causal_grad_penalty": False,
@@ -160,7 +161,7 @@ CFG = {
     "notears_lr": 1e-2,
     "notears_h_tol": 1e-8,
     "notears_rho_max": 1e16,
-    "use_optuna": True,
+    "use_optuna": False,
     "optuna_trials": 20,
     "optuna_timeout_sec": None,
     "optuna_train_epochs": 120,
@@ -745,7 +746,7 @@ def get_predictions(model, loader, scalers, mc_samples=1):
             scalars = scalars.to(DEVICE)
 
             if mc_samples > 1:
-                mean_q, _, _, _ = mc_sample_full(model, scalars, scalers, mc_samples)
+                mean_q, _, _, _, _ = mc_sample_full(model, scalars, scalers, mc_samples)
                 q_pred = mean_q
             else:
                 out = model(scalars)
@@ -768,7 +769,7 @@ def get_predictions_with_uncertainty(model, loader, scalers, mc_samples=150):
 
     for scalars, _, target in loader:
         scalars = scalars.to(DEVICE)
-        mean_q, total_std, epi_std, ale_std = mc_sample_full(model, scalars, scalers, mc_samples)
+        mean_q, total_std, epi_std, ale_std, _ = mc_sample_full(model, scalars, scalers, mc_samples)
         q_true = scalers['q'].inverse(target.numpy())
 
         preds.extend(mean_q)
@@ -1523,23 +1524,33 @@ def run_optuna_for_loss_weights(
 def calculate_exceedance_prob(model, loader, scalers, q_crit=0.1, N_mc=1000, dist='empirical'):
     probs = []
     y_true = []
-    for scalars, _, target in loader:
+
+    if isinstance(loader, torch.Tensor):
+        iterator = [(loader, None, None)]
+    else:
+        iterator = loader
+
+    for scalars, _, target in iterator:
         scalars = scalars.to(DEVICE)
-        mean_q, total_std, epi_std, ale_std, samples = mc_sample_full(model, scalars, scalers, mc_samples=N_mc)
+        _, _, _, _, samples = mc_sample_full(model, scalars, scalers, mc_samples=N_mc)
         if dist == 'empirical':
             prob_exceed = (samples > q_crit).mean(axis=0)
         else:  # lognormal
-            mu, logvar = model(scalars)
+            out = model(scalars)
+            mu = out[:, 0]
+            logvar = out[:, 1]
             sigma = torch.exp(0.5 * logvar).cpu().numpy()
             mu = mu.cpu().numpy()
             prob_exceed = 1 - norm.cdf((np.log(q_crit) - mu) / sigma)
         probs.extend(prob_exceed)
-        y_true.extend(scalers['q'].inverse(target.numpy()))
+        if target is not None:
+            y_true.extend(scalers['q'].inverse(target.numpy()))
     return np.array(probs), np.array(y_true)
 
-def plot_fragility_curve(hm0_grid, probs_grid, path):
+def plot_fragility_curve(hm0_grid, probs_grid_dict, path):
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(hm0_grid, probs_grid, label='P(q > q_crit)')
+    for q_crit, probs_grid in probs_grid_dict.items():
+        ax.plot(hm0_grid, probs_grid, label=f'P(q > {q_crit:g})')
     ax.set_xlabel('Hm0')
     ax.set_ylabel('Probability')
     ax.set_title('Fragility Curve')
@@ -1548,14 +1559,16 @@ def plot_fragility_curve(hm0_grid, probs_grid, path):
     plt.savefig(path, dpi=400)
     plt.close()
 
-def plot_reliability_diagram(y_true, probs, path):
-    observed, predicted = calibration_curve(y_true > 0.1, probs, n_bins=10)
+def plot_reliability_diagram(y_true, probs_dict, path):
     fig, ax = plt.subplots(figsize=(6, 5))
-    ax.plot(predicted, observed, marker='o')
+    for q_crit, probs in probs_dict.items():
+        observed, predicted = calibration_curve(y_true > q_crit, probs, n_bins=10)
+        ax.plot(predicted, observed, marker='o', label=f'q_crit={q_crit:g}')
     ax.plot([0,1], [0,1], 'k--')
     ax.set_xlabel('Predicted Probability')
     ax.set_ylabel('Observed Frequency')
     ax.set_title('Reliability Diagram')
+    ax.legend()
     plt.tight_layout()
     plt.savefig(path, dpi=400)
     plt.close()
@@ -2069,17 +2082,24 @@ def main():
     )
 
     # Case 1: Design-Oriented Uncertainty
-    probs_test, y_true_test = calculate_exceedance_prob(model, test_loader, scalers)
-    # For EurOtop, deterministic, so P = 1 if q_euro > q_crit else 0
-    probs_euro = (q_eurotop_test > 0.1).astype(float)
+    q_crit_values = CFG.get("q_crit_values", [1e-4, 1e-3, 1e-2])
+    probs_test_dict = {}
+    y_true_test = None
+    for q_crit in q_crit_values:
+        probs_test, y_true_local = calculate_exceedance_prob(model, test_loader, scalers, q_crit=q_crit)
+        probs_test_dict[q_crit] = probs_test
+        if y_true_test is None:
+            y_true_test = y_true_local
 
     # Fragility Curve
     X_grid, X_grid_raw, hm0_grid = create_sweep_grid(te_events, scalers, 'hm0')
-    probs_grid = calculate_exceedance_prob(model, X_grid, scalers)[0]
-    plot_fragility_curve(hm0_grid, probs_grid, os.path.join(PLOTS_DIR, "fragility_curve.png"))
+    probs_grid_dict = {}
+    for q_crit in q_crit_values:
+        probs_grid_dict[q_crit] = calculate_exceedance_prob(model, X_grid, scalers, q_crit=q_crit)[0]
+    plot_fragility_curve(hm0_grid, probs_grid_dict, os.path.join(PLOTS_DIR, "fragility_curve.png"))
 
     # Reliability Diagram
-    plot_reliability_diagram(y_true_test, probs_test, os.path.join(PLOTS_DIR, "reliability_diagram.png"))
+    plot_reliability_diagram(y_true_test, probs_test_dict, os.path.join(PLOTS_DIR, "reliability_diagram.png"))
 
     # Case 2: Extrapolation Behavior
     X_grid, X_grid_raw, hm0_grid = create_sweep_grid(tr_events, scalers, 'hm0')
